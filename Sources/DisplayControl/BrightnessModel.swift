@@ -164,12 +164,6 @@ final class BrightnessModel {
 
     // MARK: - メニュー操作
 
-    /// Primary を基準にした絶対値を受け取り、その差分を全画面に適用する。
-    func setAll(_ level: Double) {
-        guard let primary else { return }
-        applyDelta(clamp(level) - primary.brightness)
-    }
-
     func setDisplay(_ identity: String, _ level: Double) {
         setLevel(clamp(level), for: identity)
     }

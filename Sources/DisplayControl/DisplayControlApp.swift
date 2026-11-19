@@ -66,7 +66,6 @@ private struct AppRootPanel: View {
             primaryIdentity: model.primaryIdentity,
             status: model.status,
             keyboardNeedsPermission: model.keyboardNeedsPermission,
-            onSetAll: { model.setAll($0) },
             onSetDisplay: { model.setDisplay($0, $1) },
             onSelectPrimary: { model.selectPrimary($0) },
             onMatch: { model.matchToPrimary() },

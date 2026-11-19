@@ -1,6 +1,7 @@
 import SwiftUI
 
-// メニューバーから開くパネル。一括・各画面の輝度、Primaryの選択、揃え直し、終了を並べる。
+// メニューバーから開くパネル。各画面の輝度、Active画面の選択、揃え直し、終了を並べる。
+// 全画面の一括操作は輝度キーだけで行い、パネルには一括のゲージを置かない。
 // 値はすべて呼び出し側のモデルが持ち、このViewは表示と操作の通知だけを行う。
 @MainActor
 struct BrightnessPanel: View {
@@ -8,7 +9,6 @@ struct BrightnessPanel: View {
     let primaryIdentity: String?
     let status: String?
     let keyboardNeedsPermission: Bool
-    let onSetAll: (Double) -> Void
     let onSetDisplay: (String, Double) -> Void
     let onSelectPrimary: (String) -> Void
     let onMatch: () -> Void
@@ -23,10 +23,6 @@ struct BrightnessPanel: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 10)
             } else {
-                if showsAllDisplays {
-                    allDisplaysSection
-                    PanelSeparator()
-                }
                 ForEach(displays) { display in
                     displaySection(display)
                 }
@@ -42,16 +38,16 @@ struct BrightnessPanel: View {
             }
 
             PanelSeparator()
-            if showsAllDisplays {
-                MenuRowButton(title: "Match All to Primary", action: onMatch)
+            if hasMultipleDisplays {
+                MenuRowButton(title: "Match All to Active", action: onMatch)
                     .disabled(isMatched)
-                    .accessibilityHint("Sets every display to the Primary display's brightness")
+                    .accessibilityHint("Sets every display to the Active display's brightness")
             }
             if keyboardNeedsPermission {
                 MenuRowButton(title: "Enable Brightness Keys…", action: onEnableKeyboard)
                     .accessibilityHint("Brightness keys need Accessibility access")
             }
-            if showsAllDisplays || keyboardNeedsPermission {
+            if hasMultipleDisplays || keyboardNeedsPermission {
                 PanelSeparator()
             }
             MenuRowButton(title: "Quit DisplayControl", shortcut: "⌘Q", action: onQuit)
@@ -59,29 +55,6 @@ struct BrightnessPanel: View {
         }
         .padding(6)
         .frame(width: 300)
-    }
-
-    // MARK: - 一括
-
-    private var allDisplaysSection: some View {
-        let level = primaryDisplay?.brightness ?? 0
-        return VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 7) {
-                Text("All Displays").fontWeight(.semibold)
-                Spacer(minLength: 4)
-                PercentText(level: level)
-            }
-            .frame(height: 24)
-            .accessibilityHidden(true)
-
-            LevelSlider(
-                accessibilityLabel: "All Displays",
-                accessibilityHint: primaryDisplay.map { "Follows \(label(for: $0).accessibilityText); changes every display by the same amount" },
-                level: level,
-                onChange: onSetAll
-            )
-        }
-        .padding(EdgeInsets(top: 6, leading: 8, bottom: 8, trailing: 8))
     }
 
     // MARK: - 各画面
@@ -96,10 +69,10 @@ struct BrightnessPanel: View {
                 DisplayHeader(display: display, label: label, isPrimary: isPrimary)
             }
             .buttonStyle(HoverRowButtonStyle())
-            .help(isPrimary ? "Primary display" : "Set as Primary")
+            .help(isPrimary ? "Active display" : "Set as Active")
             .accessibilityLabel(label.accessibilityText)
-            .accessibilityValue(isPrimary ? "Primary" : "")
-            .accessibilityHint(isPrimary ? "" : "Sets this display as Primary")
+            .accessibilityValue(isPrimary ? "Active" : "")
+            .accessibilityHint(isPrimary ? "" : "Sets this display as Active")
             .accessibilityAddTraits(isPrimary ? .isSelected : [])
 
             LevelSlider(
@@ -123,8 +96,8 @@ struct BrightnessPanel: View {
 
     private var resolvedPrimaryIdentity: String? { primaryDisplay?.identity }
 
-    // 画面が1台だけなら一括と揃え直しは個別と同じ意味になるため出さない。
-    private var showsAllDisplays: Bool { displays.count > 1 }
+    // 画面が1台だけなら揃え直しは意味を持たないため出さない。
+    private var hasMultipleDisplays: Bool { displays.count > 1 }
 
     // 表示上の段（1%）で同じなら揃っているとみなす。
     private var isMatched: Bool {
@@ -196,7 +169,7 @@ private struct DisplayHeader: View {
 
 private struct PrimaryBadge: View {
     var body: some View {
-        Text("Primary")
+        Text("Active")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(.tint)
             .padding(.horizontal, 6)

@@ -229,20 +229,6 @@ struct BrightnessModelTests {
         #expect(await hw.writes.count == 3)
     }
 
-    @Test("一括スライダーは Primary 基準の絶対値を差分として全画面に適用する")
-    func setAllUsesPrimaryRelativeDelta() async {
-        let hw = FakeHardware(threeDisplays)
-        let model = BrightnessModel(hardware: hw)
-        await model.refresh()
-        model.selectPrimary("right")
-        model.setAll(0.7)
-        let levels = Dictionary(uniqueKeysWithValues: model.displays.map { ($0.identity, $0.brightness) })
-        #expect(levels["right"] == 0.7)
-        #expect(levels["builtin"] == 0.5)
-        #expect(levels["left"] == 0.9)
-        await model.waitUntilIdle()
-    }
-
     @Test("揃えは Primary の値に他画面だけを書き込む")
     func matchWritesOthersOnly() async {
         let hw = FakeHardware(threeDisplays)
