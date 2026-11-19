@@ -258,7 +258,8 @@ final class BrightnessKeyMonitor {
         guard let deadline = detector.deadline else { return }
         let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
         expiryTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
+            // 許容誤差を0にして、OSによるタイマーのまとめ実行で確定が遅れないようにする。
+            try? await Task.sleep(for: .seconds(delay), tolerance: .zero)
             guard let self, !Task.isCancelled else { return }
             self.dispatch(self.detector.expire(at: deadline))
         }
