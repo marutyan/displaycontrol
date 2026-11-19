@@ -44,12 +44,11 @@ enum DisplayHardwareError: Error, LocalizedError, Sendable {
     }
 }
 
-// 画面との通信を一本の直列キューで行うactor。
-// I/Oの途中にawaitを置かないので、DDCの要求と応答が他の呼び出しと交錯しない。
-// 専用キューを実行器にして、待ち時間のあるI/OでSwiftの共有スレッドやメインスレッドを塞がない。
+// 画面ごとの直列レーンを管理し、走査と書き込みの振り分けを行うactor。
+// ブロッキングI/Oや待機はこのactor上で行わず、画面ごとの専用キューへ委譲して互いに待たせない。
 actor DisplayHardware {
-    // 内部で照合済みの制御先。identityをキーに保持する。
-    private enum Target {
+    // 内部で照合済みの制御先。identityをキーに対応するDisplayLaneが保持する。
+    private enum Target: Sendable {
         case builtIn(displayID: CGDirectDisplayID, attributes: CGAttributes)
         case external(displayID: CGDirectDisplayID, attributes: CGAttributes, channel: ExternalChannel)
 
@@ -61,7 +60,7 @@ actor DisplayHardware {
     }
 
     // CoreGraphicsが報告する個体情報。書き込み直前の再照合に使う。
-    private struct CGAttributes: Equatable {
+    private struct CGAttributes: Equatable, Sendable {
         let vendor: UInt32
         let model: UInt32
         let serial: UInt32
@@ -75,30 +74,269 @@ actor DisplayHardware {
         }
     }
 
-    // 外部画面のDDC経路。サービスはscanごとに作り直し、registryIDで節点の存続を確かめる。
-    private final class ExternalChannel {
-        let registryID: UInt64
-        let service: CFTypeRef
-        let edid: EDIDInfo
-        var maximum: UInt16
-        var lastTransaction: UInt64 = 0
+    // IOAVServiceの参照を保持するラッパ。生成後は対応する1つのDisplayLaneの直列キュー内だけで使用する。
+    private final class ServiceHandle: @unchecked Sendable {
+        let raw: CFTypeRef
 
-        init(registryID: UInt64, service: CFTypeRef, edid: EDIDInfo, maximum: UInt16) {
-            self.registryID = registryID
-            self.service = service
-            self.edid = edid
-            self.maximum = maximum
+        init(_ raw: CFTypeRef) {
+            self.raw = raw
         }
     }
 
-    private let queue = DispatchSerialQueue(label: "DisplayControl.DisplayHardware", qos: .userInitiated)
-    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+    // 外部画面のDDC経路。サービスはscanごとに作り直し、registryIDで節点の存続を確かめる。
+    private struct ExternalChannel: Sendable {
+        let registryID: UInt64
+        let service: ServiceHandle
+        let edid: EDIDInfo
+        let maximum: UInt16
+    }
 
+    // 走査時にCoreGraphicsから取得した画面1台分の属性と配置。
+    private struct DisplayEntry: Sendable {
+        let index: Int
+        let displayID: CGDirectDisplayID
+        let attributes: CGAttributes
+        let x: Double
+        let y: Double
+        let isMain: Bool
+    }
+
+    // 外部AVノードからEDIDを読み取れた照合候補。双方向の一意照合を経てDisplayLaneへ渡す。
+    private struct ExternalProbe: Sendable {
+        let registryID: UInt64
+        let service: ServiceHandle
+        let edid: EDIDInfo
+    }
+
+    // 画面1台分の通信と照合状態を専用の直列キューで隔離するactor。
+    // 同一画面の読み取り・書き込み・EDID照合を重ならないように直列化し、他画面の通信を止めない。
+    private actor DisplayLane {
+        private let queue: DispatchSerialQueue
+        nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
+        private var target: Target?
+        // 直前のscanまたは書き込みで得た値。DDCの一時的な読み取り失敗時、同じ個体・同じ経路のときだけ使う。
+        private var lastBrightness: Double?
+        // 同じ外部画面へのDDCコマンド（読み取り・書き込み共通）の最終完了時刻（uptimeNanoseconds）。
+        private var lastTransaction: UInt64 = 0
+
+        init(queueLabel: String) {
+            queue = DispatchSerialQueue(label: queueLabel, qos: .userInitiated)
+        }
+
+        // 既知の外部ポートに対するEDID読み取りを、この画面の直列キュー上で実行する。
+        func probeExternalNode(_ node: AVNode, av: AVServiceAPI) -> ExternalProbe? {
+            DisplayHardware.readExternalProbe(node, av: av)
+        }
+
+        // 内蔵画面の現在値を読み取り、読めた場合または同一画面の直前値で補えた場合だけ制御先を更新する。
+        func scanBuiltIn(
+            entry: DisplayEntry,
+            identity: String,
+            displayServices: DisplayServicesAPI
+        ) -> DisplaySnapshot? {
+            guard displayServices.canChange(entry.displayID) else {
+                clearTarget()
+                return nil
+            }
+            let level: Double
+            if let measured = displayServices.read(entry.displayID) {
+                level = measured
+            } else if let cached = lastBrightness,
+                      case .builtIn(let previousID, let previousAttributes)? = target,
+                      previousID == entry.displayID,
+                      previousAttributes == entry.attributes,
+                      DisplayHardware.onlineDisplayIDs().contains(entry.displayID),
+                      CGAttributes(entry.displayID) == entry.attributes {
+                level = cached
+            } else {
+                clearTarget()
+                return nil
+            }
+            target = .builtIn(displayID: entry.displayID, attributes: entry.attributes)
+            lastBrightness = level
+            return DisplaySnapshot(
+                id: entry.displayID, identity: identity, name: "Built-in Display",
+                isBuiltIn: true, isMain: entry.isMain,
+                x: entry.x, y: entry.y, brightness: level)
+        }
+
+        // 外部画面の現在値を読み取り、読めた場合または同一経路の直前値で補えた場合だけ制御先を更新する。
+        func scanExternal(
+            entry: DisplayEntry,
+            identity: String,
+            probe: ExternalProbe,
+            av: AVServiceAPI
+        ) -> DisplaySnapshot? {
+            let maximum: UInt16
+            let level: Double
+            if let reading = readBrightness(service: probe.service, av: av) {
+                maximum = reading.maximum
+                level = Double(reading.current) / Double(reading.maximum)
+            } else if let cached = lastBrightness,
+                      case .external(let previousID, let previousAttributes, let previousChannel)? = target,
+                      previousID == entry.displayID,
+                      previousAttributes == entry.attributes,
+                      previousChannel.registryID == probe.registryID,
+                      DisplayHardware.onlineDisplayIDs().contains(entry.displayID),
+                      DisplayHardware.registryEntryExists(probe.registryID) {
+                // 識別はEDIDで今回確定済み。値だけを同じ経路の直前値で補う。
+                maximum = previousChannel.maximum
+                level = cached
+            } else {
+                clearTarget()
+                return nil
+            }
+            let channel = ExternalChannel(
+                registryID: probe.registryID,
+                service: probe.service,
+                edid: probe.edid,
+                maximum: maximum)
+            target = .external(displayID: entry.displayID, attributes: entry.attributes, channel: channel)
+            lastBrightness = level
+            return DisplaySnapshot(
+                id: entry.displayID, identity: identity, name: probe.edid.name ?? "External Display",
+                isBuiltIn: false, isMain: entry.isMain,
+                x: entry.x, y: entry.y, brightness: level)
+        }
+
+        // 制御先と直前値を破棄する。再接続直後の間隔保護のためlastTransactionは保持する。
+        func clearTarget() {
+            target = nil
+            lastBrightness = nil
+        }
+
+        // 次のDDC書き込みまで必要な残り待ち時間（ナノ秒）を返す。外部画面以外は待機不要。
+        func remainingBusWaitNanoseconds() -> UInt64 {
+            guard case .external = target else { return 0 }
+            return DDC.remainingCommandWaitNanoseconds(
+                since: lastTransaction, now: DispatchTime.now().uptimeNanoseconds)
+        }
+
+        // この画面へ輝度を書き込む。照合から送信まで同一キューで不可分に実行し、不一致なら書き込まずに拒否する。
+        func setBrightness(
+            _ level: Double,
+            for display: DisplaySnapshot,
+            av: AVServiceAPI?,
+            displayServices: DisplayServicesAPI?
+        ) throws {
+            guard level.isFinite else { throw DisplayHardwareError.invalidLevel }
+            let clamped = min(max(level, 0), 1)
+            guard let target else { throw DisplayHardwareError.unknownDisplay }
+            guard target.displayID == display.id else { throw DisplayHardwareError.stale }
+            guard DisplayHardware.onlineDisplayIDs().contains(display.id) else {
+                clearTarget()
+                throw DisplayHardwareError.disconnected
+            }
+
+            switch target {
+            case .builtIn(let displayID, let attributes):
+                guard CGAttributes(displayID) == attributes else {
+                    clearTarget()
+                    throw DisplayHardwareError.stale
+                }
+                guard let displayServices else {
+                    throw DisplayHardwareError.unavailable("DisplayServices is not available on this system.")
+                }
+                try displayServices.write(Float(clamped), to: displayID)
+                lastBrightness = clamped
+
+            case .external(let displayID, let attributes, let channel):
+                guard CGAttributes(displayID) == attributes else {
+                    clearTarget()
+                    throw DisplayHardwareError.stale
+                }
+                guard let av else {
+                    throw DisplayHardwareError.unavailable("IOAVService is not available on this system.")
+                }
+                // 経路の節点が消えていれば切断扱い。
+                guard DisplayHardware.registryEntryExists(channel.registryID) else {
+                    clearTarget()
+                    throw DisplayHardwareError.disconnected
+                }
+                // 差し替え直後の取り違えを防ぐため、書き込み直前にEDIDの個体情報を照合し直す。
+                // EDIDを読めないときは個体を確定できないので書き込まない。
+                guard let currentEDID = av.copyEDID(channel.service.raw).flatMap(EDIDInfo.init) else {
+                    throw DisplayHardwareError.communication("Could not verify the display identity.")
+                }
+                guard currentEDID.sameUnit(as: channel.edid) else {
+                    clearTarget()
+                    throw DisplayHardwareError.stale
+                }
+                guard channel.maximum > 0 else { throw DisplayHardwareError.stale }
+                let value = UInt16((clamped * Double(channel.maximum)).rounded())
+                try writeVCP(DDC.brightnessCode, value: value, channel: channel, api: av)
+                lastBrightness = Double(value) / Double(channel.maximum)
+            }
+        }
+
+        // 外部画面の現在輝度をDDC/CIで読み取る。失敗時は最大3回試す。
+        private func readBrightness(service: ServiceHandle, av: AVServiceAPI) -> (current: UInt16, maximum: UInt16)? {
+            let request = DDC.getVCPRequest(DDC.brightnessCode)
+            for attempt in 0..<3 {
+                waitForBusIdle()
+                let sendStatus = request.withUnsafeBytes {
+                    av.writeI2C(service.raw, DDC.chipAddress, DDC.hostSubAddress, $0.baseAddress!, UInt32($0.count))
+                }
+                usleep(DDC.replyDelay)
+                var reply = [UInt8](repeating: 0, count: DDC.replyLength)
+                let readStatus = reply.withUnsafeMutableBytes {
+                    av.readI2C(service.raw, DDC.chipAddress, 0, $0.baseAddress!, UInt32($0.count))
+                }
+                lastTransaction = DispatchTime.now().uptimeNanoseconds
+                if sendStatus == kIOReturnSuccess, readStatus == kIOReturnSuccess,
+                   case .value(let current, let maximum)? = DDC.parseVCPReply(reply, code: DDC.brightnessCode) {
+                    return (current, maximum)
+                }
+                // 「未対応」の正しい応答は再試行しても変わらない。
+                if case .unsupported? = DDC.parseVCPReply(reply, code: DDC.brightnessCode) { return nil }
+                if attempt < 2 { usleep(20_000) }
+            }
+            return nil
+        }
+
+        // 外部画面へVCP設定コマンドを送信する。失敗時は最大3回試す。
+        private func writeVCP(_ code: UInt8, value: UInt16, channel: ExternalChannel, api: AVServiceAPI) throws {
+            let packet = DDC.setVCPRequest(code, value: value)
+            var lastStatus: IOReturn = kIOReturnSuccess
+            for attempt in 0..<3 {
+                waitForBusIdle()
+                lastStatus = packet.withUnsafeBytes {
+                    api.writeI2C(channel.service.raw, DDC.chipAddress, DDC.hostSubAddress, $0.baseAddress!, UInt32($0.count))
+                }
+                lastTransaction = DispatchTime.now().uptimeNanoseconds
+                if lastStatus == kIOReturnSuccess { return }
+                if attempt < 2 { usleep(20_000) }
+            }
+            throw DisplayHardwareError.communication(String(format: "I2C write failed (0x%08X).", UInt32(bitPattern: lastStatus)))
+        }
+
+        // DDC/CIは連続コマンド間に最低50ms空ける必要がある。
+        private func waitForBusIdle() {
+            while true {
+                let remaining = DDC.remainingCommandWaitNanoseconds(
+                    since: lastTransaction, now: DispatchTime.now().uptimeNanoseconds)
+                guard remaining > 0 else { return }
+                // 端数を切り上げてマイクロ秒へ変換し、規定間隔を下回らないようにする。
+                let microseconds = (remaining + 999) / 1_000
+                usleep(useconds_t(min(microseconds, UInt64(useconds_t.max))))
+            }
+        }
+    }
+
+    // 画面一覧とIORegistryの列挙を行う専用キュー。協調スレッドプールや画面ごとのキューを塞がない。
+    private let scanQueue = DispatchQueue(label: "DisplayControl.DisplayHardware.scan", qos: .userInitiated)
     private let av: AVServiceAPI?
     private let displayServices: DisplayServicesAPI?
-    private var targets: [String: Target] = [:]
-    // 直前のscanで得た値。DDCの一時的な読み取り失敗時、同じ個体・同じ経路のときだけ使う。
-    private var lastBrightness: [String: Double] = [:]
+    // identityごとの専用直列レーン。
+    private var lanes: [String: DisplayLane] = [:]
+    // 直前のscanで判明した外部ポート（registryID）と担当レーンの対応。同一ポートのEDID読み取りと書き込みを直列化する。
+    private var registryLanes: [UInt64: DisplayLane] = [:]
+    // レーンのキュー名に生のidentity（シリアル等）を出さないための連番。
+    private var nextLaneNumber = 0
+    // scan()の多重実行を順番に並べるための状態。
+    private var isScanning = false
+    private var scanWaiters: [CheckedContinuation<Void, Never>] = []
 
     init() {
         av = AVServiceAPI.load()
@@ -106,167 +344,253 @@ actor DisplayHardware {
     }
 
     // 接続中で輝度を読める画面を返す。識別できない画面や読めない画面は含めない。
-    func scan() -> [DisplaySnapshot] {
-        let onlineIDs = Self.onlineDisplayIDs()
-        let previousTargets = targets
-        var newTargets: [String: Target] = [:]
-        var newBrightness: [String: Double] = [:]
-        var snapshots: [DisplaySnapshot] = []
+    // 同時に呼ばれた場合は前の走査が終わってから実行し、走査中でも他画面の書き込みを止めない。
+    func scan() async -> [DisplaySnapshot] {
+        await beginScan()
+        defer { endScan() }
+        return await performScan()
+    }
 
-        // 外部画面はEDIDの個体情報で1対1に照合できたものだけ採用する。
-        let externalMatches = matchExternalChannels(onlineIDs: onlineIDs)
-
-        for displayID in onlineIDs {
-            let attributes = CGAttributes(displayID)
-            let bounds = CGDisplayBounds(displayID)
-            let isMain = CGDisplayIsMain(displayID) != 0
-
-            if attributes.isBuiltIn {
-                guard let displayServices, displayServices.canChange(displayID) else { continue }
-                let identity = Self.builtInIdentity(attributes)
-                let measured = displayServices.read(displayID)
-                let level: Double
-                if let measured {
-                    level = measured
-                } else if let cached = lastBrightness[identity],
-                          case .builtIn(let previousID, let previousAttributes)? = previousTargets[identity],
-                          previousID == displayID, previousAttributes == attributes {
-                    level = cached
-                } else {
-                    continue
-                }
-                newTargets[identity] = .builtIn(displayID: displayID, attributes: attributes)
-                newBrightness[identity] = level
-                snapshots.append(DisplaySnapshot(
-                    id: displayID, identity: identity, name: "Built-in Display",
-                    isBuiltIn: true, isMain: isMain,
-                    x: Double(bounds.origin.x), y: Double(bounds.origin.y), brightness: level))
-                continue
-            }
-
-            guard let channel = externalMatches[displayID] else { continue }
-            let identity = Self.externalIdentity(channel.edid)
-            let level: Double
-            if let reading = readBrightness(channel) {
-                channel.maximum = reading.maximum
-                level = Double(reading.current) / Double(reading.maximum)
-            } else if let cached = lastBrightness[identity],
-                      case .external(let previousID, let previousAttributes, let previousChannel)? = previousTargets[identity],
-                      previousID == displayID, previousAttributes == attributes,
-                      previousChannel.registryID == channel.registryID {
-                // 識別はEDIDで今回確定済み。値だけを同じ経路の直前値で補う。
-                channel.maximum = previousChannel.maximum
-                level = cached
-            } else {
-                continue
-            }
-            newTargets[identity] = .external(displayID: displayID, attributes: attributes, channel: channel)
-            newBrightness[identity] = level
-            snapshots.append(DisplaySnapshot(
-                id: displayID, identity: identity, name: channel.edid.name ?? "External Display",
-                isBuiltIn: false, isMain: isMain,
-                x: Double(bounds.origin.x), y: Double(bounds.origin.y), brightness: level))
+    // 指定画面へすぐ書き込める状態（DDC/CIの最小間隔経過後）になるまで非同期に待つ。
+    // 待機中はレーンの専用キューを占有しないため、他画面や走査を止めない。
+    func waitUntilReady(for identity: String) async {
+        while !Task.isCancelled {
+            guard let lane = lanes[identity] else { return }
+            let remaining = await lane.remainingBusWaitNanoseconds()
+            guard remaining > 0 else { return }
+            try? await Task.sleep(for: .nanoseconds(remaining), clock: .suspending)
         }
-
-        targets = newTargets
-        lastBrightness = newBrightness
-        return snapshots
     }
 
     // 指定画面へ輝度を書き込む。scan時の照合と現在の接続が一致しない場合は書き込まずに拒否する。
-    func setBrightness(_ level: Double, for display: DisplaySnapshot) throws {
+    func setBrightness(_ level: Double, for display: DisplaySnapshot) async throws {
         guard level.isFinite else { throw DisplayHardwareError.invalidLevel }
-        let clamped = min(max(level, 0), 1)
-        guard let target = targets[display.identity] else { throw DisplayHardwareError.unknownDisplay }
-        guard target.displayID == display.id else { throw DisplayHardwareError.stale }
-        guard Self.onlineDisplayIDs().contains(display.id) else {
-            invalidate(display.identity)
-            throw DisplayHardwareError.disconnected
+        guard let lane = lanes[display.identity] else { throw DisplayHardwareError.unknownDisplay }
+        try await lane.setBrightness(level, for: display, av: av, displayServices: displayServices)
+    }
+
+    // MARK: - 走査の調整
+
+    // 走査の排他制御に入る。別の走査が実行中なら順番が来るまで待つ。
+    private func beginScan() async {
+        if isScanning {
+            await withCheckedContinuation { scanWaiters.append($0) }
         }
+        isScanning = true
+    }
 
-        switch target {
-        case .builtIn(let displayID, let attributes):
-            guard CGAttributes(displayID) == attributes else {
-                invalidate(display.identity)
-                throw DisplayHardwareError.stale
-            }
-            guard let displayServices else {
-                throw DisplayHardwareError.unavailable("DisplayServices is not available on this system.")
-            }
-            try displayServices.write(Float(clamped), to: displayID)
-            lastBrightness[display.identity] = clamped
-
-        case .external(let displayID, let attributes, let channel):
-            guard CGAttributes(displayID) == attributes else {
-                invalidate(display.identity)
-                throw DisplayHardwareError.stale
-            }
-            guard let av else {
-                throw DisplayHardwareError.unavailable("IOAVService is not available on this system.")
-            }
-            // 経路の節点が消えていれば切断扱い。
-            guard Self.registryEntryExists(channel.registryID) else {
-                invalidate(display.identity)
-                throw DisplayHardwareError.disconnected
-            }
-            // 差し替え直後の取り違えを防ぐため、書き込み直前にEDIDの個体情報を照合し直す。
-            // EDIDを読めないときは個体を確定できないので書き込まない。
-            guard let currentEDID = av.copyEDID(channel.service).flatMap(EDIDInfo.init) else {
-                throw DisplayHardwareError.communication("Could not verify the display identity.")
-            }
-            guard currentEDID.sameUnit(as: channel.edid) else {
-                invalidate(display.identity)
-                throw DisplayHardwareError.stale
-            }
-            guard channel.maximum > 0 else { throw DisplayHardwareError.stale }
-            let value = UInt16((clamped * Double(channel.maximum)).rounded())
-            try writeVCP(DDC.brightnessCode, value: value, channel: channel, api: av)
-            lastBrightness[display.identity] = Double(value) / Double(channel.maximum)
+    // 走査の排他制御を終え、待機中の次の走査があれば起こす。
+    private func endScan() {
+        if !scanWaiters.isEmpty {
+            scanWaiters.removeFirst().resume()
+        } else {
+            isScanning = false
         }
     }
 
-    private func invalidate(_ identity: String) {
-        targets[identity] = nil
-        lastBrightness[identity] = nil
+    // identityに対応するレーンを返す。無ければ新しい直列キュー付きレーンを作る。
+    private func lane(for identity: String) -> DisplayLane {
+        if let existing = lanes[identity] { return existing }
+        nextLaneNumber += 1
+        let created = DisplayLane(queueLabel: "DisplayControl.DisplayLane.\(nextLaneNumber)")
+        lanes[identity] = created
+        return created
+    }
+
+    // 画面一覧の取得・EDID照合・各画面の現在値読み取りを、画面ごとのレーンへ分散して実行する。
+    private func performScan() async -> [DisplaySnapshot] {
+        let av = self.av
+        let displayServices = self.displayServices
+        let snapshotInput = await runOnScanQueue {
+            let onlineIDs = Self.onlineDisplayIDs()
+            let entries = onlineIDs.enumerated().map { index, displayID in
+                let attributes = CGAttributes(displayID)
+                let bounds = CGDisplayBounds(displayID)
+                let isMain = CGDisplayIsMain(displayID) != 0
+                return DisplayEntry(
+                    index: index, displayID: displayID, attributes: attributes,
+                    x: Double(bounds.origin.x), y: Double(bounds.origin.y), isMain: isMain)
+            }
+            let hasExternal = entries.contains { !$0.attributes.isBuiltIn }
+            let nodes = (av != nil && hasExternal) ? Self.externalAVNodes() : []
+            return (entries: entries, nodes: nodes)
+        }
+
+        // 各外部ノードのEDID読み取りを並列に進める。既知ポートは対応レーンで直列化する。
+        let probes: [ExternalProbe]
+        if let av, !snapshotInput.nodes.isEmpty {
+            let knownLanes = registryLanes
+            probes = await withTaskGroup(of: ExternalProbe?.self) { group in
+                for node in snapshotInput.nodes {
+                    let knownLane = knownLanes[node.registryID]
+                    group.addTask {
+                        if let knownLane {
+                            return await knownLane.probeExternalNode(node, av: av)
+                        }
+                        return await Self.probeDetachedExternalNode(node, av: av)
+                    }
+                }
+                var collected: [ExternalProbe] = []
+                for await probe in group {
+                    if let probe { collected.append(probe) }
+                }
+                return collected
+            }
+        } else {
+            probes = []
+        }
+
+        // 外部画面はEDIDの個体情報で1対1に照合できたものだけ採用する。
+        let externalMatches = Self.matchExternalProbes(entries: snapshotInput.entries, probes: probes)
+
+        // 走査結果から確定した画面ごとの読み取り・更新計画。
+        enum LanePlan: Sendable {
+            case builtIn(entry: DisplayEntry, identity: String, lane: DisplayLane)
+            case external(entry: DisplayEntry, identity: String, probe: ExternalProbe, lane: DisplayLane)
+        }
+
+        var plans: [LanePlan] = []
+        var activeIdentities: Set<String> = []
+        for entry in snapshotInput.entries {
+            if entry.attributes.isBuiltIn {
+                guard displayServices != nil else { continue }
+                let identity = Self.builtInIdentity(entry.attributes)
+                activeIdentities.insert(identity)
+                plans.append(.builtIn(entry: entry, identity: identity, lane: lane(for: identity)))
+            } else if let probe = externalMatches[entry.displayID] {
+                let identity = Self.externalIdentity(probe.edid)
+                activeIdentities.insert(identity)
+                plans.append(.external(entry: entry, identity: identity, probe: probe, lane: lane(for: identity)))
+            }
+        }
+
+        let inactiveLanes = lanes.filter { !activeIdentities.contains($0.key) }.map(\.value)
+
+        // 外部ポートの担当レーンが変わった場合（ケーブルの差し替え等）は、新レーンが読む前に旧レーンの参照を外す。
+        var reassignedLanes: [DisplayLane] = []
+        for plan in plans {
+            if case .external(_, _, let probe, let targetLane) = plan,
+               let previousLane = registryLanes[probe.registryID],
+               previousLane !== targetLane {
+                reassignedLanes.append(previousLane)
+            }
+        }
+        if !reassignedLanes.isEmpty {
+            await withTaskGroup(of: Void.self) { group in
+                for previousLane in reassignedLanes {
+                    group.addTask { await previousLane.clearTarget() }
+                }
+            }
+        }
+
+        // 画面ごとの走査結果。元のonlineIDs順へ並べ直すためのインデックスを保持する。
+        struct ScanOutcome: Sendable {
+            let index: Int
+            let snapshot: DisplaySnapshot?
+            let registryMapping: (UInt64, DisplayLane)?
+        }
+
+        let outcomes = await withTaskGroup(of: ScanOutcome?.self) { group in
+            for inactiveLane in inactiveLanes {
+                group.addTask {
+                    await inactiveLane.clearTarget()
+                    return nil
+                }
+            }
+            for plan in plans {
+                group.addTask {
+                    switch plan {
+                    case .builtIn(let entry, let identity, let targetLane):
+                        guard let displayServices else { return nil }
+                        let snapshot = await targetLane.scanBuiltIn(
+                            entry: entry, identity: identity, displayServices: displayServices)
+                        return ScanOutcome(index: entry.index, snapshot: snapshot, registryMapping: nil)
+                    case .external(let entry, let identity, let probe, let targetLane):
+                        guard let av else { return nil }
+                        let snapshot = await targetLane.scanExternal(
+                            entry: entry, identity: identity, probe: probe, av: av)
+                        let mapping = snapshot != nil ? (probe.registryID, targetLane) : nil
+                        return ScanOutcome(index: entry.index, snapshot: snapshot, registryMapping: mapping)
+                    }
+                }
+            }
+
+            var collected: [ScanOutcome] = []
+            for await outcome in group {
+                if let outcome { collected.append(outcome) }
+            }
+            return collected
+        }
+
+        var newRegistryLanes: [UInt64: DisplayLane] = [:]
+        for outcome in outcomes {
+            if let (registryID, mappedLane) = outcome.registryMapping {
+                newRegistryLanes[registryID] = mappedLane
+            }
+        }
+        registryLanes = newRegistryLanes
+
+        return outcomes
+            .sorted { $0.index < $1.index }
+            .compactMap(\.snapshot)
+    }
+
+    // ブロッキングになり得るIOKit/CGの列挙を専用キュー上で実行し、協調スレッドプールを塞がない。
+    nonisolated private func runOnScanQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        let queue = scanQueue
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: work())
+            }
+        }
     }
 
     // MARK: - 外部画面の照合
 
-    // DCPAVServiceProxy（Location=External）を列挙し、EDIDのベンダー・製品・シリアルが
-    // CoreGraphicsの画面と互いにちょうど1つずつ一致したものだけ返す。
-    // 名前や列挙順では決めない。シリアル0や重複は曖昧なので採用しない。
-    private func matchExternalChannels(onlineIDs: [CGDirectDisplayID]) -> [CGDirectDisplayID: ExternalChannel] {
-        guard let av else { return [:] }
-        let candidates = onlineIDs.filter { CGDisplayIsBuiltin($0) == 0 }
-        guard !candidates.isEmpty else { return [:] }
-
-        var channels: [ExternalChannel] = []
-        for node in Self.externalAVNodes() {
-            defer { IOObjectRelease(node.entry) }
-            guard let service = av.createService(node.entry) else { continue }
-            // EDIDは一時的に読めないことがあるので数回試す。読めなければその経路は今回は使わない。
-            var edid: EDIDInfo?
-            for attempt in 0..<3 {
-                if let data = av.copyEDID(service), let parsed = EDIDInfo(data) {
-                    edid = parsed
-                    break
-                }
-                if attempt < 2 { usleep(20_000) }
+    // まだレーンに紐づいていない外部ノードのEDID読み取りを、協調スレッドプール外で実行する。
+    private static func probeDetachedExternalNode(_ node: AVNode, av: AVServiceAPI) async -> ExternalProbe? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: readExternalProbe(node, av: av))
             }
-            guard let edid else { continue }
-            channels.append(ExternalChannel(registryID: node.registryID, service: service, edid: edid, maximum: 0))
         }
+    }
 
-        var result: [CGDirectDisplayID: ExternalChannel] = [:]
-        for displayID in candidates {
-            let attributes = CGAttributes(displayID)
-            guard attributes.serial != 0 else { continue }
-            let matchingChannels = channels.filter { Self.edid($0.edid, matches: attributes) }
-            guard matchingChannels.count == 1, let channel = matchingChannels.first else { continue }
+    // 外部AVノードからサービスを生成し、EDIDを最大3回試して読み取る。ノード参照は必ず解放する。
+    private static func readExternalProbe(_ node: AVNode, av: AVServiceAPI) -> ExternalProbe? {
+        defer { IOObjectRelease(node.entry) }
+        guard let service = av.createService(node.entry) else { return nil }
+        // EDIDは一時的に読めないことがあるので数回試す。読めなければその経路は今回は使わない。
+        var edid: EDIDInfo?
+        for attempt in 0..<3 {
+            if let data = av.copyEDID(service), let parsed = EDIDInfo(data) {
+                edid = parsed
+                break
+            }
+            if attempt < 2 { usleep(20_000) }
+        }
+        guard let edid else { return nil }
+        return ExternalProbe(registryID: node.registryID, service: ServiceHandle(service), edid: edid)
+    }
+
+    // EDIDのベンダー・製品・シリアルがCoreGraphicsの画面と互いにちょうど1つずつ一致したものだけ返す。
+    // 名前や列挙順では決めない。シリアル0や重複は曖昧なので採用しない。
+    private static func matchExternalProbes(
+        entries: [DisplayEntry],
+        probes: [ExternalProbe]
+    ) -> [CGDirectDisplayID: ExternalProbe] {
+        let candidates = entries.filter { !$0.attributes.isBuiltIn }
+        guard !candidates.isEmpty, !probes.isEmpty else { return [:] }
+
+        var result: [CGDirectDisplayID: ExternalProbe] = [:]
+        for candidate in candidates {
+            guard candidate.attributes.serial != 0 else { continue }
+            let matchingProbes = probes.filter { edid($0.edid, matches: candidate.attributes) }
+            guard matchingProbes.count == 1, let probe = matchingProbes.first else { continue }
             // 逆方向も一意であること。同じ個体情報を持つCG画面が複数あれば採用しない。
-            let matchingDisplays = candidates.filter { Self.edid(channel.edid, matches: CGAttributes($0)) }
-            guard matchingDisplays == [displayID] else { continue }
-            result[displayID] = channel
+            let matchingDisplays = candidates.filter { edid(probe.edid, matches: $0.attributes) }
+            guard matchingDisplays.count == 1, matchingDisplays[0].displayID == candidate.displayID else { continue }
+            result[candidate.displayID] = probe
         }
         return result
     }
@@ -275,7 +599,7 @@ actor DisplayHardware {
         edid.matches(vendor: attributes.vendor, model: attributes.model, serial: attributes.serial)
     }
 
-    private struct AVNode {
+    private struct AVNode: Sendable {
         let entry: io_registry_entry_t
         let registryID: UInt64
     }
@@ -327,56 +651,6 @@ actor DisplayHardware {
     private static func externalIdentity(_ edid: EDIDInfo) -> String {
         "edid:" + edid.manufacturerID + String(format: "-%04X-%08X", edid.productCode, edid.serial)
     }
-
-    // MARK: - DDC/CI
-
-    private func readBrightness(_ channel: ExternalChannel) -> (current: UInt16, maximum: UInt16)? {
-        guard let av else { return nil }
-        let request = DDC.getVCPRequest(DDC.brightnessCode)
-        for attempt in 0..<3 {
-            waitForBusIdle(channel)
-            let sendStatus = request.withUnsafeBytes {
-                av.writeI2C(channel.service, DDC.chipAddress, DDC.hostSubAddress, $0.baseAddress!, UInt32($0.count))
-            }
-            usleep(DDC.replyDelay)
-            var reply = [UInt8](repeating: 0, count: DDC.replyLength)
-            let readStatus = reply.withUnsafeMutableBytes {
-                av.readI2C(channel.service, DDC.chipAddress, 0, $0.baseAddress!, UInt32($0.count))
-            }
-            channel.lastTransaction = DispatchTime.now().uptimeNanoseconds
-            if sendStatus == kIOReturnSuccess, readStatus == kIOReturnSuccess,
-               case .value(let current, let maximum)? = DDC.parseVCPReply(reply, code: DDC.brightnessCode) {
-                return (current, maximum)
-            }
-            // 「未対応」の正しい応答は再試行しても変わらない。
-            if case .unsupported? = DDC.parseVCPReply(reply, code: DDC.brightnessCode) { return nil }
-            if attempt < 2 { usleep(20_000) }
-        }
-        return nil
-    }
-
-    private func writeVCP(_ code: UInt8, value: UInt16, channel: ExternalChannel, api: AVServiceAPI) throws {
-        let packet = DDC.setVCPRequest(code, value: value)
-        var lastStatus: IOReturn = kIOReturnSuccess
-        for attempt in 0..<3 {
-            waitForBusIdle(channel)
-            lastStatus = packet.withUnsafeBytes {
-                api.writeI2C(channel.service, DDC.chipAddress, DDC.hostSubAddress, $0.baseAddress!, UInt32($0.count))
-            }
-            channel.lastTransaction = DispatchTime.now().uptimeNanoseconds
-            if lastStatus == kIOReturnSuccess { return }
-            if attempt < 2 { usleep(20_000) }
-        }
-        throw DisplayHardwareError.communication(String(format: "I2C write failed (0x%08X).", UInt32(bitPattern: lastStatus)))
-    }
-
-    // DDC/CIは連続コマンド間に最低50ms空ける必要がある。
-    private func waitForBusIdle(_ channel: ExternalChannel) {
-        guard channel.lastTransaction != 0 else { return }
-        let elapsed = DispatchTime.now().uptimeNanoseconds &- channel.lastTransaction
-        let required = UInt64(DDC.commandInterval) * 1_000
-        if elapsed < required { usleep(useconds_t((required - elapsed) / 1_000)) }
-    }
 }
 
 // MARK: - DDC/CIのパケット
@@ -427,6 +701,16 @@ enum DDC {
         guard maximum > 0, current <= maximum else { return nil }
         return .value(current: current, maximum: maximum)
     }
+
+    // 前回のDDC通信完了時刻から、次のコマンドを送るまでに必要な残り待ち時間（ナノ秒）を返す。
+    // 初回（0）は待たず、時刻が逆転した場合は安全側として規定間隔ぶん待つ。
+    static func remainingCommandWaitNanoseconds(since lastTransaction: UInt64, now: UInt64) -> UInt64 {
+        guard lastTransaction != 0 else { return 0 }
+        let required = UInt64(commandInterval) * 1_000
+        guard now >= lastTransaction else { return required }
+        let elapsed = now - lastTransaction
+        return elapsed < required ? required - elapsed : 0
+    }
 }
 
 // MARK: - EDID
@@ -475,7 +759,7 @@ struct EDIDInfo: Equatable, Sendable {
 // MARK: - 非公開APIの動的読み込み
 
 // IOAVService（Apple Silicon の外部画面DDC経路）。シンボルが無い環境ではnilになり、外部画面は対象外になる。
-private struct AVServiceAPI {
+private struct AVServiceAPI: Sendable {
     private typealias CreateFn = @convention(c) (CFAllocator?, io_service_t) -> UnsafeMutableRawPointer?
     private typealias CopyEDIDFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> IOReturn
     private typealias WriteFn = @convention(c) (UnsafeMutableRawPointer, UInt32, UInt32, UnsafeRawPointer, UInt32) -> IOReturn
@@ -523,7 +807,7 @@ private struct AVServiceAPI {
 }
 
 // DisplayServices（内蔵画面の輝度）。フレームワークが無い環境ではnilになり、内蔵画面は対象外になる。
-private struct DisplayServicesAPI {
+private struct DisplayServicesAPI: Sendable {
     private typealias CanChangeFn = @convention(c) (UInt32) -> Bool
     private typealias GetFn = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
     private typealias SetFn = @convention(c) (UInt32, Float) -> Int32
