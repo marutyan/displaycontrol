@@ -4,6 +4,8 @@ import Observation
 /// モデルが使う画面通信の境界。実機は `DisplayHardware`、テストでは偽装実装を差し込む。
 protocol BrightnessHardware: Sendable {
     func scan() async -> [DisplaySnapshot]
+    /// 指定画面へ書き込める状態（DDC/CIの最小間隔経過後など）になるまで待つ。
+    func waitUntilReady(for identity: String) async
     func setBrightness(_ level: Double, for display: DisplaySnapshot) async throws
 }
 
@@ -236,10 +238,18 @@ final class BrightnessModel {
         workers[identity] = Task { await self.drain(identity) }
     }
 
-    /// 1画面分の送信を直列に処理する。待っている間に来た値は最新の1件だけ送る。
+    /// 1画面分の送信を直列に処理する。書ける状態になるまで待ってから最新の1件だけ送る。
     private func drain(_ identity: String) async {
         var needsReread = false
-        while let level = pending.removeValue(forKey: identity) {
+        while pending[identity] != nil {
+            // 切断済みの画面は間隔待ちをせずに未送信値を捨てる。
+            guard displays.contains(where: { $0.identity == identity }) else {
+                pending.removeValue(forKey: identity)
+                break
+            }
+            // DDCの間隔待ちなどが終わってから送る値を確定させ、待機中の新しい値を反映する。
+            await hardware.waitUntilReady(for: identity)
+            guard let level = pending.removeValue(forKey: identity) else { break }
             let generation = generations[identity, default: 0]
             // 送信直前の最新スナップショットを使う。切断済みなら捨てる。
             guard let target = displays.first(where: { $0.identity == identity }) else { continue }
