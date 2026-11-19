@@ -98,11 +98,17 @@ final class ActiveDisplayTracker {
     private var lastOtherPID: pid_t?
     /// アプリ切り替え通知の購読トークン。破棄時に監視を解除するために保持する。
     private var activationObserver: (any NSObjectProtocol)?
+    /// 全体のクリック監視のトークン。デスクトップのクリックを見分けるために使い、破棄時に解除する。
+    private var clickMonitor: Any?
+    /// 直前にデスクトップ（通常のウインドウが無い場所）をクリックした位置。
+    /// Finder が前面のあいだは、Finder のウインドウよりこの位置の画面を優先する。
+    private var desktopClickLocation: CGPoint?
 
     private let frontmostPIDProvider: @MainActor () -> pid_t?
     private let displayBoundsProvider: @MainActor (CGDirectDisplayID) -> CGRect
     private let windowListProvider: @MainActor () -> [[String: Any]]?
     private let mouseLocationProvider: @MainActor () -> CGPoint?
+    private let isFinderProvider: @MainActor (pid_t) -> Bool
 
     /// システムの前面アプリ・画面配置・ウインドウ一覧・ポインタ位置を参照する既定のトラッカーを作る。
     convenience init() {
@@ -112,7 +118,8 @@ final class ActiveDisplayTracker {
             frontmostPID: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
             displayBounds: { CGDisplayBounds($0) },
             windowList: { Self.copyOnScreenWindowInfo() },
-            mouseLocation: { CGEvent(source: nil)?.location }
+            mouseLocation: { CGEvent(source: nil)?.location },
+            isFinder: { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier == "com.apple.finder" }
         )
     }
 
@@ -123,13 +130,15 @@ final class ActiveDisplayTracker {
         frontmostPID: @escaping @MainActor () -> pid_t?,
         displayBounds: @escaping @MainActor (CGDirectDisplayID) -> CGRect,
         windowList: @escaping @MainActor () -> [[String: Any]]?,
-        mouseLocation: @escaping @MainActor () -> CGPoint?
+        mouseLocation: @escaping @MainActor () -> CGPoint?,
+        isFinder: @escaping @MainActor (pid_t) -> Bool = { _ in false }
     ) {
         self.selfPID = selfPID
         self.frontmostPIDProvider = frontmostPID
         self.displayBoundsProvider = displayBounds
         self.windowListProvider = windowList
         self.mouseLocationProvider = mouseLocation
+        self.isFinderProvider = isFinder
 
         // 起動時点で既に他アプリが前面なら、最初のメニュー操作から直前アプリを参照できるよう記録する。
         if let pid = frontmostPID(), pid != selfPID {
@@ -150,6 +159,13 @@ final class ActiveDisplayTracker {
                     self?.recordActivatedApplication(pid: pid)
                 }
             }
+            // 他アプリへのクリックを受け取る。NSEvent は Sendable でないため、先に位置だけ取り出す。
+            self.clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                guard let location = event.cgEvent?.location else { return }
+                MainActor.assumeIsolated {
+                    self?.recordClick(at: location)
+                }
+            }
         }
     }
 
@@ -157,6 +173,9 @@ final class ActiveDisplayTracker {
     isolated deinit {
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+        if let clickMonitor {
+            NSEvent.removeMonitor(clickMonitor)
         }
     }
 
@@ -170,7 +189,15 @@ final class ActiveDisplayTracker {
         }
         guard !displays.isEmpty else { return nil }
 
-        if let targetPID = resolveTargetPID(),
+        let targetPID = resolveTargetPID()
+        // デスクトップをクリックして Finder が前面になったときは、Finder の別画面のウインドウではなくクリックした画面にする。
+        if let targetPID, isFinderProvider(targetPID), let desktopClickLocation,
+           let displayID = ActiveDisplayGeometry.displayID(containing: desktopClickLocation, among: displays)
+        {
+            return displayID
+        }
+
+        if let targetPID,
            let windowList = windowListProvider(),
            let windowBounds = Self.frontmostWindowBounds(for: targetPID, in: windowList),
            let displayID = ActiveDisplayGeometry.displayID(for: windowBounds, among: displays)
@@ -191,6 +218,26 @@ final class ActiveDisplayTracker {
     func recordActivatedApplication(pid: pid_t) {
         guard pid != selfPID else { return }
         lastOtherPID = pid
+        // Finder 以外へ切り替わったら、デスクトップのクリックはもう前面の操作を表さない。
+        if !isFinderProvider(pid) { desktopClickLocation = nil }
+    }
+
+    /// クリック位置を記録する。通常のウインドウが無い場所ならデスクトップのクリックとして覚え、ウインドウ上なら忘れる。
+    func recordClick(at location: CGPoint) {
+        guard let windowList = windowListProvider() else { return }
+        desktopClickLocation = Self.isDesktopClick(at: location, in: windowList) ? location : nil
+    }
+
+    /// 位置が通常の層（層0）のどのウインドウにも入っていなければ、デスクトップのクリックとみなす。
+    /// 通知センターのように画面全体を覆う透明な上位層のウインドウがあるため、層0だけで判定する。
+    static func isDesktopClick(at location: CGPoint, in windowList: [[String: Any]]) -> Bool {
+        !windowList.contains { info in
+            guard layerValue(info[kCGWindowLayer as String]) == 0,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
+            else { return false }
+            return rect.contains(location)
+        }
     }
 
     /// Active 画面の判定に使うアプリの PID を返す。自分が前面のときは直前の他アプリを使う。

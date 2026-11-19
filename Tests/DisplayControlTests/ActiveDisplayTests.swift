@@ -130,6 +130,7 @@ private final class StubEnvironment {
     var boundsMap: [CGDirectDisplayID: CGRect]
     var windows: [[String: Any]]?
     var pointer: CGPoint?
+    var finderPID: pid_t?
 
     init(
         frontPID: pid_t? = nil,
@@ -151,7 +152,8 @@ private final class StubEnvironment {
             frontmostPID: { self.frontPID },
             displayBounds: { self.boundsMap[$0] ?? .zero },
             windowList: { self.windows },
-            mouseLocation: { self.pointer }
+            mouseLocation: { self.pointer },
+            isFinder: { $0 == self.finderPID }
         )
     }
 }
@@ -220,6 +222,40 @@ struct ActiveDisplayTrackerTests {
         tracker.recordActivatedApplication(pid: 300)
         tracker.recordActivatedApplication(pid: 100)
         #expect(tracker.currentDisplayID(among: [1, 2]) == 2)
+    }
+
+    @Test("デスクトップをクリックして Finder が前面のあいだは、Finder の別画面のウインドウよりクリックした画面を選ぶ")
+    func desktopClickWinsWhileFinderIsFrontmost() {
+        // Finder (500) のウインドウは左の画面 1 にあり、主画面 2 のデスクトップは空いている。
+        // 主画面全体を覆う上位層（通知センター相当）のウインドウはデスクトップ判定に影響しない。
+        let env = StubEnvironment(
+            frontPID: 300,
+            boundsMap: [1: leftBounds, 2: mainBounds],
+            windows: [
+                windowInfo(pid: pid_t(900), layer: 23, bounds: mainBounds),
+                windowInfo(pid: pid_t(500), layer: 0, bounds: CGRect(x: -1500, y: 100, width: 800, height: 600)),
+                windowInfo(pid: pid_t(300), layer: 0, bounds: CGRect(x: 200, y: 100, width: 800, height: 600)),
+            ]
+        )
+        env.finderPID = 500
+        let tracker = env.makeTracker(selfPID: 100)
+
+        // 主画面のデスクトップ（ウインドウの外）をクリックし、Finder が前面になる。
+        tracker.recordClick(at: CGPoint(x: 1300, y: 900))
+        env.frontPID = 500
+        tracker.recordActivatedApplication(pid: 500)
+        #expect(tracker.currentDisplayID(among: [1, 2]) == 2)
+
+        // Finder のウインドウをクリックしたら、そのウインドウの画面 1 に戻る。
+        tracker.recordClick(at: CGPoint(x: -1000, y: 300))
+        #expect(tracker.currentDisplayID(among: [1, 2]) == 1)
+
+        // もう一度デスクトップをクリックした後、別アプリ (300) へ切り替えたらデスクトップの記録は使わない。
+        tracker.recordClick(at: CGPoint(x: 1300, y: 900))
+        env.frontPID = 300
+        tracker.recordActivatedApplication(pid: 300)
+        env.frontPID = 500
+        #expect(tracker.currentDisplayID(among: [1, 2]) == 1)
     }
 
     @Test("通常ウインドウが無いときや取得失敗時はポインタ位置へフォールバックし、決まらなければ nil")
