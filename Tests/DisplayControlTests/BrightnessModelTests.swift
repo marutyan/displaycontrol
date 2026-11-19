@@ -326,12 +326,12 @@ struct BrightnessModelTests {
         await model.refresh()
         await hw.setHeldWriteIdentities(["right"])
 
-        // Primary（builtin: 0.4）を 0.5 に上げ、全画面に +0.1 を適用する。
-        model.setAll(0.5)
+        // 輝度キーの1段（+0.0625）を全画面に適用する。
+        model.perform(.step(1))
         await waitFor { await hw.waitingCount(for: "right") == 1 }
         await waitFor {
-            let builtInDone = await hw.writtenLevels("builtin") == [0.5]
-            let leftDone = await hw.writtenLevels("left") == [0.9]
+            let builtInDone = await hw.writtenLevels("builtin") == [0.4625]
+            let leftDone = await hw.writtenLevels("left") == [0.8625]
             return builtInDone && leftDone
         }
         // right がまだ書き込み中でも、builtin と left の追加書き込みはそのまま完了する。
@@ -339,8 +339,8 @@ struct BrightnessModelTests {
         model.setDisplay("builtin", 0.25)
         model.setDisplay("left", 0.75)
         await waitFor {
-            let builtInDone = await hw.writtenLevels("builtin") == [0.5, 0.25]
-            let leftDone = await hw.writtenLevels("left") == [0.9, 0.75]
+            let builtInDone = await hw.writtenLevels("builtin") == [0.4625, 0.25]
+            let leftDone = await hw.writtenLevels("left") == [0.8625, 0.75]
             return builtInDone && leftDone
         }
         #expect(await hw.writtenLevels("right") == [])
@@ -348,7 +348,7 @@ struct BrightnessModelTests {
         await hw.setHeldWriteIdentities([])
         await hw.releaseWrite(for: "right")
         await model.waitUntilIdle()
-        #expect(await hw.writtenLevels("right") == [0.7])
+        #expect(await hw.writtenLevels("right") == [0.6625])
     }
 
     /// 1画面が書ける状態待ち（DDC間隔待ち）で止まっていても、他画面の書き込みが止まらないことを確かめる。
@@ -359,11 +359,11 @@ struct BrightnessModelTests {
         await model.refresh()
         await hw.setHeldReadyIdentities(["right"])
 
-        model.setAll(0.5)
+        model.perform(.step(1))
         await waitFor { await hw.readyWaitingCount(for: "right") == 1 }
         await waitFor {
-            let builtInDone = await hw.writtenLevels("builtin") == [0.5]
-            let leftDone = await hw.writtenLevels("left") == [0.9]
+            let builtInDone = await hw.writtenLevels("builtin") == [0.4625]
+            let leftDone = await hw.writtenLevels("left") == [0.8625]
             return builtInDone && leftDone
         }
         #expect(await hw.writtenLevels("right") == [])
@@ -371,7 +371,7 @@ struct BrightnessModelTests {
         await hw.setHeldReadyIdentities([])
         await hw.releaseReady(for: "right")
         await model.waitUntilIdle()
-        #expect(await hw.writtenLevels("right") == [0.7])
+        #expect(await hw.writtenLevels("right") == [0.6625])
     }
 
     /// 書ける状態になるのを待つ間に来た連続操作が、待機終了後に最新の1件だけ送られることを確かめる。
