@@ -98,7 +98,12 @@ final class AppController {
     private var started = false
 
     private init() {
-        let model = BrightnessModel(hardware: DisplayHardware())
+        // Active 画面は前面のウインドウがある画面。キー操作やメニューを開いたときにこの追跡器へ問い合わせる。
+        let tracker = ActiveDisplayTracker()
+        let model = BrightnessModel(
+            hardware: DisplayHardware(),
+            activeDisplay: { tracker.currentDisplayID(among: $0) }
+        )
         self.model = model
         self.keys = BrightnessKeyMonitor(
             isActive: { model.hasControllableDisplays },

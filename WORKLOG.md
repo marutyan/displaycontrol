@@ -82,3 +82,4 @@ MacBook Pro（M3 Pro、macOS 27.3）と Dell S2725QC 2台の実輝度を、英�
 - 2026-11-20 アクセシビリティを有効にしてもキーが効かなかった。原因は、設定画面の項目が以前のビルドの cdhash に結びついていたこと（tccd のログに `Failed to match existing code requirement`）。項目を削除して入れ直すと、event tap が登録された。
 - 2026-11-20 再発を防ぐため、`build-app.sh` はキーチェーンに Apple Development の証明書があればそれで署名する（ユーザー承認済み）。識別条件はバンドルIDと証明書になり、ビルドし直しても許可が保たれる。署名は複製で確認済みで、`dist` への反映はキー試験の後に行う。あわせて、システム設定から直接許可されたときも、通知（`com.apple.accessibility.api`）を受けて起動し直さずに tap を張るようにした。この動作は実機で未確認。
 - 2026-11-20 ユーザーの説明で、Shift＋輝度キーは「Active画面を切り替える」ではなく「Active画面だけを変える」操作だと分かった。Active画面は前面ウインドウの画面とする。キー判定・モデル・メニューは Claude Code が変更し、前面ウインドウから画面を求める処理（`ActiveDisplay.swift`）は Antigravity が別のworktreeで並行して作成中。
+- 2026-11-20 Antigravity の `ActiveDisplay.swift`（前面アプリのウインドウ矩形から画面を求め、ウインドウが無ければポインタの画面）を統合し、アプリにつないだ。`swift test` 35件成功。実機の読み取り確認では、画面収録の権限なしで前面の端末ウインドウの矩形を取得し、そのウインドウがある左のDellをActive画面と判定した。
