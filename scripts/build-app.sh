@@ -1,5 +1,5 @@
 #!/bin/zsh
-# DisplayControl.app を作業ツリーの dist/ に生成する。アドホック署名のみで、インストールはしない。
+# DisplayControl.app を作業ツリーの dist/ に生成する。インストールはしない。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,6 +7,13 @@ CONFIG="${CONFIG:-release}"
 APP="$ROOT/dist/DisplayControl.app"
 BUNDLE_ID="local.displaycontrol.DisplayControl"
 VERSION="${VERSION:-0.1.0}"
+# 署名に使う証明書。アドホック署名は本体のハッシュで識別されるため、ビルドのたびにアクセシビリティの許可が外れる。
+# キーチェーンに Apple Development の証明書があればそれで署名し、ビルドし直しても同じアプリとして扱わせる。
+# 無ければアドホック署名（-）にする。SIGN_IDENTITY で明示的に指定もできる。
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk '/"Apple Development: /{print $2; exit}')"
+fi
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 cd "$ROOT"
 # SCRATCH_PATH を指定すると中間生成物を作業ツリー外に置ける。
@@ -62,7 +69,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
-codesign --force --sign - --timestamp=none "$APP"
+codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP"
 codesign --verify --strict "$APP"
 
 # 同じボリューム内の rename で置き換える。新版の移動に失敗したら旧版を戻す。

@@ -142,6 +142,8 @@ final class BrightnessKeyMonitor {
     private var consumedKeys: Set<BrightnessKey> = []
     private var expiryTask: Task<Void, Never>?
     private var permissionPoll: Task<Void, Never>?
+    /// システム設定で直接許可されたときに気づくための通知の購読。tap を張ったら解除する。
+    private var trustObserver: NSObjectProtocol?
 
     init(
         isActive: @escaping @MainActor () -> Bool,
@@ -159,6 +161,25 @@ final class BrightnessKeyMonitor {
             installTap()
         } else {
             permissionChanged(true)
+            observeTrustChanges()
+        }
+    }
+
+    /// アクセシビリティの許可一覧が変わると macOS が配る通知を受け、許可されていれば tap を張る。
+    /// ボタンを押さずにシステム設定から直接許可した場合も、起動し直さずにキーを使えるようにする。
+    private func observeTrustChanges() {
+        guard trustObserver == nil else { return }
+        trustObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.accessibility.api"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                // 通知は許可の反映より先に届くことがあるため、少し待ってから確かめる。
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, self.tap == nil, AXIsProcessTrusted() else { return }
+                self.installTap()
+            }
         }
     }
 
@@ -208,6 +229,10 @@ final class BrightnessKeyMonitor {
         CGEvent.tapEnable(tap: port, enable: true)
         tap = port
         runLoopSource = source
+        if let trustObserver {
+            DistributedNotificationCenter.default().removeObserver(trustObserver)
+            self.trustObserver = nil
+        }
         permissionChanged(false)
     }
 
