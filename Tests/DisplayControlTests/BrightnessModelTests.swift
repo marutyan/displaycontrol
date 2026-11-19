@@ -126,55 +126,56 @@ struct BrightnessModelTests {
         snapshot("left", x: -2500, y: 0, brightness: 0.8),
     ]
 
-    @Test("起動時の読み取りは書き込みをせず、表示順は x 次いで y、初回 Primary は主画面")
+    @Test("起動時の読み取りは書き込みをせず、表示順は x 次いで y、前面ウインドウが決まらなければ Active は主画面")
     func startupIsReadOnly() async {
         let hw = FakeHardware(threeDisplays)
         let model = BrightnessModel(hardware: hw)
         await model.refresh()
         #expect(model.displays.map(\.identity) == ["left", "builtin", "right"])
-        #expect(model.primaryIdentity == "builtin")
+        #expect(model.activeIdentity == "builtin")
         #expect(model.status == nil)
         #expect(await hw.writes.isEmpty)
     }
 
-    @Test("Shift 切替は表示順で巡回し、輝度を変えない")
-    func cyclePrimaryInOrder() async {
-        let hw = FakeHardware(threeDisplays)
-        let model = BrightnessModel(hardware: hw)
+    @Test("Shift 付きの段階変化は、キーを押した時点の前面ウインドウがある画面だけを変える")
+    func stepActiveChangesOnlyFrontmostWindowDisplay() async {
+        var displays = threeDisplays
+        displays[0] = snapshot("right", x: 3000, brightness: 0.6, id: 3)
+        displays[2] = snapshot("left", x: -2500, brightness: 0.8, id: 2)
+        let hw = FakeHardware(displays)
+        var frontmost: UInt32? = 3
+        let model = BrightnessModel(hardware: hw, activeDisplay: { _ in frontmost })
         await model.refresh()
         var shown: [String] = []
         model.feedback = { title, _ in shown.append(title) }
-        model.perform(.cyclePrimary(1))
-        #expect(model.primaryIdentity == "right")
-        model.perform(.cyclePrimary(1))
-        #expect(model.primaryIdentity == "left")
-        model.perform(.cyclePrimary(-1))
-        #expect(model.primaryIdentity == "right")
-        #expect(shown == ["RIGHT", "LEFT", "RIGHT"])
+
+        model.perform(.stepActive(1))
+        #expect(model.activeIdentity == "right")
+        frontmost = 2
+        model.perform(.stepActive(-1))
+        #expect(model.activeIdentity == "left")
+
+        let levels = Dictionary(uniqueKeysWithValues: model.displays.map { ($0.identity, $0.brightness) })
+        #expect(levels["right"] == 0.6625)
+        #expect(levels["left"] == 0.7375)
+        #expect(levels["builtin"] == 0.4)
+        #expect(shown == ["RIGHT", "LEFT"])
         await model.waitUntilIdle()
-        #expect(await hw.writes.isEmpty)
+        #expect(await hw.writtenLevels("builtin").isEmpty)
+        #expect(await hw.writtenLevels("right") == [0.6625])
+        #expect(await hw.writtenLevels("left") == [0.7375])
     }
 
-    @Test("選んだ Primary は再走査で保持し、切断中は主画面、再接続で復帰する")
-    func primarySurvivesTopologyChanges() async {
+    @Test("前面ウインドウの画面が操作できない画面なら、Active は主画面になる")
+    func activeFallsBackToMainDisplay() async {
         let hw = FakeHardware(threeDisplays)
-        let model = BrightnessModel(hardware: hw)
+        let model = BrightnessModel(hardware: hw, activeDisplay: { _ in 12345 })
         await model.refresh()
-        model.selectPrimary("right")
+        #expect(model.activeIdentity == "builtin")
+        // 主画面もなければ表示順の先頭。
+        await hw.setDisplays(threeDisplays.filter { !$0.isMain })
         await model.refresh()
-        #expect(model.primaryIdentity == "right")
-
-        await hw.setDisplays(threeDisplays.filter { $0.identity != "right" })
-        await model.refresh()
-        #expect(model.primaryIdentity == "builtin")
-
-        // 再接続で DisplayID が変わっても identity で復帰する。
-        var back = threeDisplays
-        back[0] = snapshot("right", x: 3000, brightness: 0.6, id: 99)
-        await hw.setDisplays(back)
-        await model.refresh()
-        #expect(model.primaryIdentity == "right")
-        #expect(model.primary?.id == 99)
+        #expect(model.activeIdentity == "left")
     }
 
     @Test("送信中に来た値は画面ごとに最新の1件へまとめる")
@@ -275,7 +276,7 @@ struct BrightnessModelTests {
         #expect(await hw.writes.count == 3)
     }
 
-    @Test("揃えは Primary の値に他画面だけを書き込む")
+    @Test("揃えは Active 画面の値に他画面だけを書き込む")
     func matchWritesOthersOnly() async {
         let hw = FakeHardware(threeDisplays)
         let model = BrightnessModel(hardware: hw)
@@ -296,7 +297,7 @@ struct BrightnessModelTests {
         #expect(model.status == "No controllable displays found.")
         model.perform(.step(1))
         model.perform(.match)
-        model.perform(.cyclePrimary(1))
+        model.perform(.stepActive(1))
         await model.waitUntilIdle()
         #expect(await hw.writes.isEmpty)
     }

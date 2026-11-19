@@ -51,9 +51,9 @@ struct KeyChordDetector {
 
     let chordWindow: TimeInterval
     private(set) var held: Set<BrightnessKey> = []
-    /// 同時押し判定待ちの Shift なし押下。Shift 付きは保留せず即座に切り替える。
+    /// 同時押し判定待ちの Shift なし押下。Shift 付きは保留せず即座に Active 画面を変える。
     private var pendingPress: (key: BrightnessKey, time: TimeInterval)?
-    /// Shift 付きで押されたキー。離すまでリピートを無視する。
+    /// Shift 付きで押されたキー。離すまでのリピートは Active 画面だけを変える。
     private var shiftPressed: Set<BrightnessKey> = []
     /// 同時押しで揃えた後、両方離すまで追加の操作を出さない。
     private var chordLatched = false
@@ -71,9 +71,10 @@ struct KeyChordDetector {
         // タイマーが遅れても、期限切れかどうかは入力時刻で判定する。
         var actions = expire(at: time)
         if isRepeat {
-            // 押し続けによるリピートは通常キーのときだけ段階変化にする。
-            guard !chordLatched, pendingPress == nil, held.contains(key),
-                  !shift, !shiftPressed.contains(key) else { return actions }
+            // リピートは押し始めの種類を引き継ぐ。Shift 付きで押したキーは Active 画面だけを変え続ける。
+            guard !chordLatched, pendingPress == nil, held.contains(key) else { return actions }
+            if shiftPressed.contains(key) { return actions + [.stepActive(key.direction)] }
+            guard !shift else { return actions }
             return actions + [.step(key.direction)]
         }
 
@@ -92,7 +93,7 @@ struct KeyChordDetector {
         }
         if shift {
             shiftPressed.insert(key)
-            return actions + [.cyclePrimary(key.direction)]
+            return actions + [.stepActive(key.direction)]
         }
         shiftPressed.remove(key)
         pendingPress = (key, time)

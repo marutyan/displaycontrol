@@ -41,18 +41,27 @@ struct KeyChordDetectorTests {
         #expect(d.press(.up, shift: false, isRepeat: false, at: 3.01) == [.match])
     }
 
-    @Test("Shift 付きは初回の押下で Primary を切り替え、同じキーのリピートは無視する")
-    func shiftCyclesPrimary() {
+    @Test("Shift 付きは押した瞬間に Active 画面だけを変え、リピートでも Active 画面だけを変え続ける")
+    func shiftStepsActiveDisplay() {
         var d = KeyChordDetector()
-        #expect(d.press(.up, shift: true, isRepeat: false, at: 0) == [.cyclePrimary(1)])
+        #expect(d.press(.up, shift: true, isRepeat: false, at: 0) == [.stepActive(1)])
         #expect(d.deadline == nil)
         #expect(d.release(.up, at: 0.01) == [])
-        #expect(d.press(.down, shift: true, isRepeat: false, at: 1) == [.cyclePrimary(-1)])
-        #expect(d.press(.down, shift: true, isRepeat: true, at: 1.5) == [])
-        // Shift を先に離しても、そのキーを離すまでリピートで段階変化にしない。
-        #expect(d.press(.down, shift: false, isRepeat: true, at: 1.6) == [])
+        #expect(d.press(.down, shift: true, isRepeat: false, at: 1) == [.stepActive(-1)])
+        #expect(d.press(.down, shift: true, isRepeat: true, at: 1.5) == [.stepActive(-1)])
+        // Shift を先に離しても、そのキーを離すまでは Active 画面だけを変える。
+        #expect(d.press(.down, shift: false, isRepeat: true, at: 1.6) == [.stepActive(-1)])
         #expect(d.release(.down, at: 2) == [])
         #expect(d.expire(at: 3) == [])
+    }
+
+    @Test("Shift なしで押したキーのリピート中に Shift を押しても、全画面にも Active 画面にも効かない")
+    func shiftAddedDuringPlainRepeatIsIgnored() {
+        var d = KeyChordDetector()
+        _ = d.press(.up, shift: false, isRepeat: false, at: 0)
+        #expect(d.expire(at: 0.1) == [.step(1)])
+        #expect(d.press(.up, shift: true, isRepeat: true, at: 0.5) == [])
+        #expect(d.press(.up, shift: false, isRepeat: true, at: 0.6) == [.step(1)])
     }
 
     @Test("期限切れで確定した後の反対キーは揃えずに普通の操作になる")
@@ -85,11 +94,11 @@ struct KeyChordDetectorTests {
         var d = KeyChordDetector(chordWindow: 0.075)
         // Shift なしの保留中に Shift 付きの反対キー。
         _ = d.press(.up, shift: false, isRepeat: false, at: 0)
-        #expect(d.press(.down, shift: true, isRepeat: false, at: 0.02) == [.step(1), .cyclePrimary(-1)])
+        #expect(d.press(.down, shift: true, isRepeat: false, at: 0.02) == [.step(1), .stepActive(-1)])
         #expect(d.release(.up, at: 0.05) == [])
         #expect(d.release(.down, at: 0.05) == [])
         // Shift 付きで押した後に Shift なしの反対キー。
-        #expect(d.press(.up, shift: true, isRepeat: false, at: 1) == [.cyclePrimary(1)])
+        #expect(d.press(.up, shift: true, isRepeat: false, at: 1) == [.stepActive(1)])
         #expect(d.press(.down, shift: false, isRepeat: false, at: 1.02) == [])
         #expect(d.release(.down, at: 1.03) == [.step(-1)])
         #expect(d.release(.up, at: 1.04) == [])

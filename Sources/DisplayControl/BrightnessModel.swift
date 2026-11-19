@@ -15,9 +15,9 @@ extension DisplayHardware: BrightnessHardware {}
 enum KeyAction: Equatable, Sendable {
     /// 全画面に同じ差分を適用する（+1 / -1 段）。
     case step(Int)
-    /// Primary を表示順で前後に切り替える（+1 / -1）。
-    case cyclePrimary(Int)
-    /// 現在の Primary の値に全画面を揃える。
+    /// Active 画面だけを1段変える（+1 / -1 段）。
+    case stepActive(Int)
+    /// 現在の Active 画面の値に全画面を揃える。
     case match
 }
 
@@ -31,8 +31,8 @@ final class BrightnessModel {
 
     /// 表示順（x、次に y）に並べた接続中の画面。brightness は手元の最新意図値。
     private(set) var displays: [DisplaySnapshot] = []
-    /// 実際に使っている Primary。
-    private(set) var primaryIdentity: String?
+    /// Active 画面（前面のウインドウがある画面）。キー操作・再走査・メニューを開いたときに決め直す。
+    private(set) var activeIdentity: String?
     /// キー入力に権限が必要な状態か。キー監視側が更新する。
     var keyboardNeedsPermission = false
 
@@ -58,8 +58,8 @@ final class BrightnessModel {
     @ObservationIgnored var feedback: (@MainActor (String, Double?) -> Void)?
 
     @ObservationIgnored private let hardware: any BrightnessHardware
-    /// ユーザーが選んだ Primary。切断中も保持し、再接続で復帰させる。
-    @ObservationIgnored private var preferredPrimary: String?
+    /// 候補の画面ID から Active 画面を返す関数。実機では前面ウインドウを調べ、テストでは固定値を返す。
+    @ObservationIgnored private let resolveActiveDisplay: @MainActor ([UInt32]) -> UInt32?
     /// 画面ごとの未送信の最新値。
     @ObservationIgnored private var pending: [String: Double] = [:]
     /// 画面ごとの意図の世代。新しい操作のたびに増える。
@@ -70,13 +70,17 @@ final class BrightnessModel {
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var scheduledRefresh: Task<Void, Never>?
 
-    init(hardware: any BrightnessHardware) {
+    init(
+        hardware: any BrightnessHardware,
+        activeDisplay: @escaping @MainActor ([UInt32]) -> UInt32? = { _ in nil }
+    ) {
         self.hardware = hardware
+        self.resolveActiveDisplay = activeDisplay
     }
 
-    var primary: DisplaySnapshot? {
-        guard let primaryIdentity else { return nil }
-        return displays.first { $0.identity == primaryIdentity }
+    var active: DisplaySnapshot? {
+        guard let activeIdentity else { return nil }
+        return displays.first { $0.identity == activeIdentity }
     }
 
     // MARK: - 読み取り
@@ -140,7 +144,7 @@ final class BrightnessModel {
         let present = Set(displays.map(\.identity))
         pending = pending.filter { present.contains($0.key) }
         writeFailures = writeFailures.filter { present.contains($0.key) }
-        resolvePrimary()
+        updateActive()
         notice = displays.isEmpty ? "No controllable displays found." : nil
     }
 
@@ -153,15 +157,13 @@ final class BrightnessModel {
         }
     }
 
-    private func resolvePrimary() {
-        let ids = Set(displays.map(\.identity))
-        if let preferredPrimary, ids.contains(preferredPrimary) {
-            primaryIdentity = preferredPrimary
-        } else if let main = displays.first(where: \.isMain) {
-            primaryIdentity = main.identity
-        } else {
-            primaryIdentity = displays.first?.identity
-        }
+    /// 前面のウインドウから Active 画面を決め直す。決まらなければ macOS の主画面、それもなければ先頭の画面にする。
+    func updateActive() {
+        let resolved = resolveActiveDisplay(displays.map(\.id))
+        let identity = displays.first { $0.id == resolved }?.identity
+            ?? displays.first(where: \.isMain)?.identity
+            ?? displays.first?.identity
+        if activeIdentity != identity { activeIdentity = identity }
     }
 
     // MARK: - メニュー操作
@@ -170,40 +172,32 @@ final class BrightnessModel {
         setLevel(clamp(level), for: identity)
     }
 
-    func selectPrimary(_ identity: String) {
-        guard displays.contains(where: { $0.identity == identity }) else { return }
-        preferredPrimary = identity
-        primaryIdentity = identity
-    }
-
-    /// 全画面を Primary の値に揃える。
-    func matchToPrimary() {
-        guard let primary else { return }
-        for display in displays where display.identity != primary.identity {
-            setLevel(primary.brightness, for: display.identity)
+    /// 全画面を Active 画面の値に揃える。Active 画面はメニューに表示中のものを使い、ここでは決め直さない。
+    func matchToActive() {
+        guard let active else { return }
+        for display in displays where display.identity != active.identity {
+            setLevel(active.brightness, for: display.identity)
         }
     }
 
     // MARK: - キー操作
 
     func perform(_ action: KeyAction) {
+        // キーを押した時点の前面ウインドウで Active 画面を決める。
+        updateActive()
         switch action {
         case .step(let direction):
-            guard primary != nil else { return }
+            guard active != nil else { return }
             applyDelta(Double(direction) * Self.keyStep)
-            feedback?("All Displays", primary?.brightness)
-        case .cyclePrimary(let direction):
-            guard !displays.isEmpty else { return }
-            let index = displays.firstIndex { $0.identity == primaryIdentity } ?? 0
-            let count = displays.count
-            let next = displays[((index + direction) % count + count) % count]
-            selectPrimary(next.identity)
-            // 切替は輝度を変えないのでレベルは出さない。
-            feedback?(hudTitle(for: next), nil)
+            feedback?("All Displays", active?.brightness)
+        case .stepActive(let direction):
+            guard let target = active else { return }
+            setLevel(clamp(target.brightness + Double(direction) * Self.keyStep), for: target.identity)
+            feedback?(hudTitle(for: target), active?.brightness)
         case .match:
-            guard let primary else { return }
-            matchToPrimary()
-            feedback?("Matched to \(hudTitle(for: primary))", primary.brightness)
+            guard let active else { return }
+            matchToActive()
+            feedback?("Matched to \(hudTitle(for: active))", active.brightness)
         }
     }
 

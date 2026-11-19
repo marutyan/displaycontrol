@@ -63,12 +63,12 @@ private struct AppRootPanel: View {
         let model = controller.model
         BrightnessPanel(
             displays: model.displays,
-            primaryIdentity: model.primaryIdentity,
+            activeIdentity: model.activeIdentity,
             status: model.status,
             keyboardNeedsPermission: model.keyboardNeedsPermission,
             onSetDisplay: { model.setDisplay($0, $1) },
-            onSelectPrimary: { model.selectPrimary($0) },
-            onMatch: { model.matchToPrimary() },
+            onOpen: { model.updateActive() },
+            onMatch: { model.matchToActive() },
             onEnableKeyboard: { controller.keys.requestPermission() },
             onQuit: { NSApp.terminate(nil) }
         )

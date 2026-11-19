@@ -1,16 +1,18 @@
 import SwiftUI
 
-// メニューバーから開くパネル。各画面の輝度、Active画面の選択、揃え直し、終了を並べる。
+// メニューバーから開くパネル。各画面の輝度、Active画面の表示、揃え直し、終了を並べる。
+// Active画面は前面のウインドウがある画面で、モデルが自動で決める。パネルでは選ばない。
 // 全画面の一括操作は輝度キーだけで行い、パネルには一括のゲージを置かない。
 // 値はすべて呼び出し側のモデルが持ち、このViewは表示と操作の通知だけを行う。
 @MainActor
 struct BrightnessPanel: View {
     let displays: [DisplaySnapshot]
-    let primaryIdentity: String?
+    let activeIdentity: String?
     let status: String?
     let keyboardNeedsPermission: Bool
     let onSetDisplay: (String, Double) -> Void
-    let onSelectPrimary: (String) -> Void
+    /// パネルを開いたときに呼ぶ。開く直前の前面ウインドウで Active 画面を決め直すために使う。
+    let onOpen: () -> Void
     let onMatch: () -> Void
     let onEnableKeyboard: () -> Void
     let onQuit: () -> Void
@@ -55,25 +57,20 @@ struct BrightnessPanel: View {
         }
         .padding(6)
         .frame(width: 300)
+        .onAppear(perform: onOpen)
     }
 
     // MARK: - 各画面
 
     private func displaySection(_ display: DisplaySnapshot) -> some View {
-        let isPrimary = display.identity == resolvedPrimaryIdentity
+        let isActive = display.identity == resolvedActiveIdentity
         let label = label(for: display)
         return VStack(alignment: .leading, spacing: 3) {
-            Button {
-                onSelectPrimary(display.identity)
-            } label: {
-                DisplayHeader(display: display, label: label, isPrimary: isPrimary)
-            }
-            .buttonStyle(HoverRowButtonStyle())
-            .help(isPrimary ? "Active display" : "Set as Active")
-            .accessibilityLabel(label.accessibilityText)
-            .accessibilityValue(isPrimary ? "Active" : "")
-            .accessibilityHint(isPrimary ? "" : "Sets this display as Active")
-            .accessibilityAddTraits(isPrimary ? .isSelected : [])
+            DisplayHeader(display: display, label: label, isActive: isActive)
+                .help(isActive ? "Active display: the one with the frontmost window" : "")
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(label.accessibilityText)
+                .accessibilityValue(isActive ? "Active" : "")
 
             LevelSlider(
                 accessibilityLabel: label.accessibilityText,
@@ -87,22 +84,22 @@ struct BrightnessPanel: View {
 
     // MARK: - 状態の導出
 
-    // 選択中のPrimaryが一覧にないとき（再検出直後など）はmacOSの主画面、なければ先頭を表示上の基準にする。
-    private var primaryDisplay: DisplaySnapshot? {
-        displays.first { $0.identity == primaryIdentity }
+    // Active画面が一覧にないとき（再検出直後など）はmacOSの主画面、なければ先頭を表示上の基準にする。
+    private var activeDisplay: DisplaySnapshot? {
+        displays.first { $0.identity == activeIdentity }
             ?? displays.first { $0.isMain }
             ?? displays.first
     }
 
-    private var resolvedPrimaryIdentity: String? { primaryDisplay?.identity }
+    private var resolvedActiveIdentity: String? { activeDisplay?.identity }
 
     // 画面が1台だけなら揃え直しは意味を持たないため出さない。
     private var hasMultipleDisplays: Bool { displays.count > 1 }
 
     // 表示上の段（1%）で同じなら揃っているとみなす。
     private var isMatched: Bool {
-        guard let primary = primaryDisplay else { return true }
-        let target = (primary.brightness * 100).rounded()
+        guard let active = activeDisplay else { return true }
+        let target = (active.brightness * 100).rounded()
         return displays.allSatisfy { ($0.brightness * 100).rounded() == target }
     }
 
@@ -140,12 +137,12 @@ struct DisplayLabel: Equatable {
 private struct DisplayHeader: View {
     let display: DisplaySnapshot
     let label: DisplayLabel
-    let isPrimary: Bool
+    let isActive: Bool
 
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: display.isBuiltIn ? "laptopcomputer" : "display")
-                .foregroundStyle(isPrimary ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .foregroundStyle(isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                 .frame(width: 16)
             Text(label.name)
                 .fontWeight(.semibold)
@@ -157,8 +154,8 @@ private struct DisplayHeader: View {
                     .lineLimit(1)
                     .fixedSize()
             }
-            if isPrimary {
-                PrimaryBadge()
+            if isActive {
+                ActiveBadge()
             }
             Spacer(minLength: 4)
             PercentText(level: display.brightness)
@@ -167,7 +164,7 @@ private struct DisplayHeader: View {
     }
 }
 
-private struct PrimaryBadge: View {
+private struct ActiveBadge: View {
     var body: some View {
         Text("Active")
             .font(.system(size: 11, weight: .semibold))
@@ -358,30 +355,6 @@ private struct MenuRowButtonStyle: ButtonStyle {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .fill(highlighted ? Color.accentColor : .clear)
                 )
-                .contentShape(Rectangle())
-                .onHover { isHovered = $0 }
-        }
-    }
-}
-
-// 画面の見出し行。押すとPrimaryになる。ポインタが乗ると薄く塗る。
-private struct HoverRowButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        HoverRowBody(configuration: configuration)
-    }
-
-    private struct HoverRowBody: View {
-        let configuration: ButtonStyleConfiguration
-        @State private var isHovered = false
-
-        var body: some View {
-            configuration.label
-                .padding(.horizontal, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(Color.primary.opacity(configuration.isPressed ? 0.10 : isHovered ? 0.06 : 0))
-                )
-                .padding(.horizontal, -4)
                 .contentShape(Rectangle())
                 .onHover { isHovered = $0 }
         }

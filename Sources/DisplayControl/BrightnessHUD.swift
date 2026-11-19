@@ -53,7 +53,7 @@ final class BrightnessHUDPresenter {
         panel.alphaValue = 0
     }
 
-    /// 表示内容を差し替えて出す。`level` が nil のときはバーを出さない（Primaryの切り替えなど）。
+    /// 表示内容を差し替えて出す。`level` が nil のときはバーを出さない（輝度を変えない通知など）。
     func show(title: String, level: Double?) {
         hostingView.rootView = BrightnessHUDView(title: title, level: level.map { min(max($0, 0), 1) })
         layout()
